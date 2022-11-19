@@ -29,8 +29,12 @@ contract UniV3TradingPair is IERC721Receiver {
     address public immutable poolToken0;
     address public immutable poolToken1;
     uint24 public immutable FEE;
+    address public immutable treasury;
+    address public immutable settlerInit;
 
     uint256 private constant MINT_BURN_SLIPPAGE = 200; // .5% max slippage on order creation
+    uint256 public protocolFee = 0; //protocol fee share in bps
+    uint256 public settlerFee = 5; //settlerFee in bps
 
     string public pairName;
 
@@ -64,6 +68,8 @@ contract UniV3TradingPair is IERC721Receiver {
         poolToken0 = IUniswapV3Pool(0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8).token0();
         poolToken1 = IUniswapV3Pool(0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8).token1();
         FEE = IUniswapV3Pool(0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8).fee();
+        treasury = msg.sender;
+        settlerInit = msg.sender;
     }
 
     /*----------------------------------------------------------*/
@@ -87,14 +93,26 @@ contract UniV3TradingPair is IERC721Receiver {
     event Close();
     event Increase();
     event Decrease();
-    event PriceChanged();
+    event Settled(
+            bool side,
+            uint256 positionId,
+            address trader,
+            uint256 executionPrice,
+            uint256 quantity
+    );
 
     /*----------------------------------------------------------*/
     /*                  USER FACING FUNCTIONS                   */
     /*----------------------------------------------------------*/
 
     /// notice: Opens a limit order my minting a LP position on the 0.3% Uniswap v3 Pair
-    function createOrder(bool side, int24 tickLower, int24 tickUpper, uint256 quantity) public payable returns (uint256 positionId) {
+    function createOrder(
+        bool side,
+        uint160 sqrtPriceX96, //uniswap sqrt(price) * 2 ** 96
+        //int24 tickLower,
+        //int24 tickUpper,
+        uint256 quantity
+    ) public payable returns (uint256 positionId) {
 
         address token = side ? poolToken1 : poolToken0; 
 
@@ -108,6 +126,10 @@ contract UniV3TradingPair is IERC721Receiver {
             address(nftManager),
             quantity
         );
+
+        int24 tickUpper;
+        int24 tickLower;
+        ( tickLower, tickUpper) = getTicksFromPrice(side, sqrtPriceX96);
 
         uint128 _liquidity;
         uint256 _amount0;
@@ -132,14 +154,18 @@ contract UniV3TradingPair is IERC721Receiver {
 
         emit Open();
     }
-/*
+
     function increaseSize(
         uint256 positionId,
         uint256 quantity
     ) external {
         require(
-            orders[positionId].owner == msg.sender && orders[positionId].active,
-            "NTO/NA" //not the owner/Not active
+            orders[positionId].owner == msg.sender,
+            "NTO" //not the owner
+        );
+        require(
+            orders[positionId].active,
+            "NA" //not active
         );
 
         address token = getLiquidityToken(positionId);
@@ -150,24 +176,23 @@ contract UniV3TradingPair is IERC721Receiver {
             quantity
         );
 
-        uint256 amount = orders[positionId].side ? 0 : quantity;
+        uint128 _liquidity;
+        uint256 _amount0;
+        uint256 _amount1;
+
+        (_liquidity, _amount0, _amount1) = increaseLiquidityCurrentRange(positionId, token, quantity);
         
-        increaseLiquidityCurrentRange(positionId, token, amount);
-        
-        orders[positionId].quantity += quantity;
+        orders[positionId].quantity = _amount0 + _amount1;
+        orders[positionId].liquidity = _liquidity;
         
         emit Increase();
     }
-*/
+
     /// notice: Decreases the order size of a limit order position
     function decreaseSize(
         uint256 positionId,
         uint256 quantity
-    ) public returns 
-    (
-        uint256 amount0,
-        uint256 amount1
-    ) {
+    ) public {
         require(
             orders[positionId].owner == msg.sender,
             "NTO" //not the owner
@@ -189,11 +214,11 @@ contract UniV3TradingPair is IERC721Receiver {
         (_amount0, _amount1, fees0, fees1) = withdraw(positionId, quantity);
 
         //update liquidity values
-        orders[positionId].quantity -= quantity;
+        orders[positionId].quantity -= _amount0 + _amount1;
         orders[positionId].liquidity = getPositionLiquidity(positionId);
         if(orders[positionId].liquidity<0) {
             orders[positionId].active = false;
-            burn(positionId);
+            //burn(positionId);
         }
         
         //transfer back the tokens to the msg.sender
@@ -213,14 +238,15 @@ contract UniV3TradingPair is IERC721Receiver {
     external {
         uint256 _quantity = orders[positionId].quantity;
         decreaseSize(positionId,_quantity); //decrease by the total position Size
+
+        emit Close();
     }
 
-    //
+    //Called from a settler that collects trading fees for settling trades
     function settleOrder(
         uint256 positionId
     ) external {
         int24 poolTick = getCurrentPoolTick();
-        address token = getLiquidityToken(positionId);
 
         //Check that the position is fully out of range
         require(
@@ -230,8 +256,99 @@ contract UniV3TradingPair is IERC721Receiver {
             ,"ONF" // order not filled
         );
 
+        //check that the position is active
+        require(
+            orders[positionId].active,
+            "NA" //not active
+        );
+
+        uint256 _amount0;
+        uint256 _amount1;
+        uint256 positionFee0;
+        uint256 positionFee1;
+
+        (_amount0, _amount1, positionFee0, positionFee1) = withdraw(
+            positionId
+            ,orders[positionId].quantity //withdraw function handles conversion of quantity to liquidity --> no worries
+        );
+
+        //handles tokens distribution between user, treasury and settler
+        settle(positionId, _amount0, _amount1, positionFee0, positionFee1);
+
+        //update position
+        orders[positionId].active = false;
+
+        //calculate executionPrice as token0/token1 -- for USDC/WETH pool: amount of USDC sent/received divided by amount of WETH sent/received
+        uint256 executionPrice = getExecutionPrice(positionId, _amount0 + positionFee0, _amount1 + positionFee1);
+
+        emit Settled(
+            orders[positionId].side,
+            positionId,
+            orders[positionId].owner,
+            executionPrice,
+            orders[positionId].quantity
+        );
+    }
+
+    function settle(
+        uint256 positionId,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 positionFee0,
+        uint256 positionFee1
+    ) private {
+        uint256 bpsDivide = 10000; // 100*100
+        
+        /*uint256 userAmount0;
+        uint256 userAmount1;
+        uint256 protocolFees0;
+        uint256 protocolFees1;
+        uint256 settlerFees0;
+        uint256 settlerFees1;
+        */
+
+        //calc protocol + settler fees
+        uint256 protocolFees0 = orders[positionId].side ? (amount0.add(positionFee0)).div(bpsDivide).mul(protocolFee) : positionFee0.mul(protocolFee.div(protocolFee.add(settlerFee)));
+        uint256 protocolFees1 = orders[positionId].side ? positionFee1.mul(protocolFee.div(protocolFee.add(settlerFee))) : (amount1.add(positionFee1)).div(bpsDivide).mul(protocolFee);
+        uint256 settlerFees0 = orders[positionId].side ? (amount0.add(positionFee0)).div(bpsDivide).mul(settlerFee) : positionFee0.mul(settlerFee.div(protocolFee.add(settlerFee)));
+        uint256 settlerFees1 = orders[positionId].side ? positionFee1.mul(settlerFee.div(protocolFee.add(settlerFee))) : (amount1.add(positionFee1)).div(bpsDivide).mul(settlerFee);
+
+        //all that remains goes to the user
+        uint256 userAmount0 = orders[positionId].side ? (amount0.add(positionFee0)).sub(protocolFees0.add(settlerFees0)) : 0 ;
+        uint256 userAmount1 = orders[positionId].side ? 0 : (amount1.add(positionFee1)).sub(protocolFees1.add(settlerFees1)) ;
+
+        //settle user amounts, here we choose not to send dust (accumulated Uniswap fees on the other side of the trade) to the user
+        if (userAmount0 > 0) {
+            IERC20(poolToken0).safeTransfer(orders[positionId].owner, userAmount0);
+        }
+        
+        if (userAmount1 > 0) {
+            IERC20(poolToken1).safeTransfer(orders[positionId].owner, userAmount1);
+        }
+
+        //settle treasury amounts
+        IERC20(poolToken0).safeTransfer(treasury, protocolFees0);
+        IERC20(poolToken1).safeTransfer(treasury, protocolFees1);
+
+        //settle settler amounts
+        IERC20(poolToken0).safeTransfer(msg.sender, settlerFees0);
+        IERC20(poolToken1).safeTransfer(msg.sender, settlerFees1);
 
     }
+
+    function getExecutionPrice(
+        uint256 positionId,
+        uint256 userAmount0,
+        uint256 userAmount1
+    ) public view returns(
+        uint256 price
+    ) {
+        price = orders[positionId].side ? userAmount0.div(orders[positionId].quantity) : orders[positionId].quantity.div(userAmount1);
+    }
+
+    /*----------------------------------------------------------*/
+    /*          UNISWAP POSITION MANAGER FUNCTIONS              */
+    /*----------------------------------------------------------*/
 
     function mintNewPosition(
         bool side,
@@ -280,10 +397,45 @@ contract UniV3TradingPair is IERC721Receiver {
     function increaseLiquidityCurrentRange(
         uint256 positionId,
         address token,
-        uint256 amount
-    ) private {
-        //increase liquidity here
+        uint256 quantity
+    ) private returns(
+        uint128 newLiquidity,
+        uint256 newAmount0,
+        uint256 newAmount1
+    ){
+        (int24 tickLower, int24 tickUpper) = getTicks(positionId);
+
+        //require that pool price is outside of order range
+        int24 currentTick = getCurrentPoolTick();
+        require(
+            tickUpper != currentTick && tickLower != currentTick, // ticks are always next to each other so that's enough
+            "LPA" // Liquidity position is active
+        );
+
+        uint256 amount0toAdd = orders[positionId].side ? 0 : quantity;
+        uint256 amount1toAdd = orders[positionId].side ? quantity : 0;
+
+        //add liquidity
+        (newLiquidity, newAmount0, newAmount1) = nftManager.increaseLiquidity(
+            INonfungiblePositionManager.IncreaseLiquidityParams({
+                tokenId: positionId,
+                amount0Desired: amount0toAdd,
+                amount1Desired: amount1toAdd,
+                amount0Min: amount0toAdd.sub(
+                    amount0toAdd.div(MINT_BURN_SLIPPAGE)
+                ),
+                amount1Min: amount1toAdd.sub(
+                    amount1toAdd.div(MINT_BURN_SLIPPAGE)
+                ),
+                deadline: block.timestamp
+            })
+        );
+
+        //refund unspent tokens to the user
+        uint256 refund = orders[positionId].side ? amount1toAdd + orders[positionId].quantity - newAmount1 : amount0toAdd + orders[positionId].quantity - newAmount0; 
+        IERC20(token).safeTransfer(msg.sender, refund);
     }
+
 
     function withdraw(
         uint256 positionId,
@@ -316,7 +468,7 @@ contract UniV3TradingPair is IERC721Receiver {
 
 
 
-    function getLiquidityFromAmount(uint256 positionId, uint256 amount) private returns (uint128 _liquidity) {
+    function getLiquidityFromAmount(uint256 positionId, uint256 amount) private view returns (uint128 _liquidity) {
         _liquidity = uint128(amount.mul(orders[positionId].liquidity).div(orders[positionId].quantity));
     }
 
@@ -324,9 +476,7 @@ contract UniV3TradingPair is IERC721Receiver {
         uint256 positionId,
         uint128 liquidity
     ) private returns (uint256 amount0, uint256 amount1){
-        //decrease liq
-        require(orders[positionId].active,"NA"); //not active
-
+        
         (int24 tickLower, int24 tickUpper) = getTicks(positionId);
 
         uint256 _amount0;
@@ -350,13 +500,6 @@ contract UniV3TradingPair is IERC721Receiver {
         );
     }
 
-    function getAmountsForLiquidity(
-        uint128 liquidity,
-        uint256 positionId
-    ) public view returns (uint256 amount0, uint256 amount1) {
-        (int24 tickLower, int24 tickUpper) = getTicks(positionId);
-        
-    }
 
     function getTicks(
         uint256 positionId
@@ -366,16 +509,11 @@ contract UniV3TradingPair is IERC721Receiver {
         );
     }
 
-    
-
     function burn(uint256 tokenId) private {
         nftManager.burn(tokenId);
     }
     
-    /**
-     * notice Collect fees generated from position
-     */
-
+    // Collect fees
     function collect(
         uint256 positionId
     ) private returns (uint256 collected0, uint256 collected1) {
@@ -390,9 +528,7 @@ contract UniV3TradingPair is IERC721Receiver {
         return orders[positionId].side ? poolToken1 : poolToken0;
     }
 
-    /**
-     *  dev Collect token amounts from pool position -- tokens need to have been withdrawn with decreaseLiquidity
-     */
+    //Collect token amounts from pool position -- tokens need to have been withdrawn with decreaseLiquidity
     function collectPosition(
         uint128 amount0,
         uint128 amount1,
@@ -409,11 +545,20 @@ contract UniV3TradingPair is IERC721Receiver {
         );
     }
 
-    function collectFees(
-        uint256 positionId,
-        address recipient
-    ) private {
-        //collect fees
+    function getTicksFromPrice(bool side, uint160 sqrtPriceX96) public view returns(
+        int24 tickLower,
+        int24 tickUpper
+    ) {
+        int24 tickSpacing = pool.tickSpacing();
+        int24 closestTick = TickMath.getTickAtSqrtRatio(sqrtPriceX96);
+
+        if(side) {
+            tickUpper = closestTick - (closestTick % tickSpacing);
+            tickLower = tickUpper - tickSpacing;
+        } else {
+            tickLower = closestTick - (closestTick % tickSpacing) + tickSpacing;
+            tickUpper = tickLower + tickSpacing;
+        }
     }
 
 
@@ -442,7 +587,7 @@ contract UniV3TradingPair is IERC721Receiver {
 
 
     /*----------------------------------------------------------*/
-    /*                      TEST FUNCTIONS                      */
+    /*                    POSITION GETTERS                      */
     /*----------------------------------------------------------*/
 
    function getSide(uint256 positionId) public view returns (bool side) {
