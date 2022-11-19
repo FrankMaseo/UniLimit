@@ -33,13 +33,13 @@ contract UniV3TradingPair is IERC721Receiver {
     address public immutable settlerInit;
 
     uint256 private constant MINT_BURN_SLIPPAGE = 200; // .5% max slippage on order creation
+    
     uint256 public protocolFee = 0; //protocol fee share in bps
     uint256 public settlerFee = 5; //settlerFee in bps
 
     string public pairName;
 
     INonfungiblePositionManager public immutable nftManager;
-
     IUniswapV3Pool public immutable pool;
 
     struct Order {
@@ -55,21 +55,21 @@ contract UniV3TradingPair is IERC721Receiver {
     mapping(uint256 => Order) orders;
     
     constructor(
-        //IUniswapV3Pool _pool,
-        //INonfungiblePositionManager _nftManager
+        address pool_address,
+        address _nftManager,
+        address _treasury,
+        address _settlerInit
     ) {
-        //_registerInterface(IERC721Receiver.onERC721Received.selector);
         //pool = _pool;
         //nftManager = _nftManager;
-        pool = IUniswapV3Pool(0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8);
-        nftManager = INonfungiblePositionManager(0xC36442b4a4522E871399CD717aBDD847Ab11FE88);
-        pairName = "ETH/USDC";
+        pool = IUniswapV3Pool(pool_address);
+        nftManager = INonfungiblePositionManager(_nftManager);
         owner = msg.sender;
-        poolToken0 = IUniswapV3Pool(0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8).token0();
-        poolToken1 = IUniswapV3Pool(0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8).token1();
-        FEE = IUniswapV3Pool(0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8).fee();
-        treasury = msg.sender;
-        settlerInit = msg.sender;
+        poolToken0 = IUniswapV3Pool(pool_address).token0();
+        poolToken1 = IUniswapV3Pool(pool_address).token1();
+        FEE = IUniswapV3Pool(pool_address).fee();
+        treasury = _treasury;
+        settlerInit = _settlerInit;
     }
 
     /*----------------------------------------------------------*/
@@ -618,4 +618,23 @@ contract UniV3TradingPair is IERC721Receiver {
         //If someone sends gas to the contract, account it uner their address
         gasProvision[msg.sender]+=msg.value; 
     }*/
+
+    /*----------------------------------------------------------*/
+    /*                         SETTERS                          */
+    /*----------------------------------------------------------*/
+
+    function setProtocolFee(uint256 feeBips) public {
+        require(msg.sender == owner, "Not the owner");
+        protocolFee = feeBips;
+    }
+
+    function setSettlerFee(uint256 feeBips) public {
+        require(msg.sender == owner, "Not the owner");
+        settlerFee = feeBips;
+    }
+
+    function setPairName(string calldata _name) public {
+        require(msg.sender == owner, "Not the owner");
+        pairName = _name;
+    }
 }
