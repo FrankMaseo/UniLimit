@@ -34,8 +34,14 @@ contract UniV3TradingPair is IERC721Receiver {
 
     uint256 private constant MINT_BURN_SLIPPAGE = 200; // .5% max slippage on order creation
     
-    uint256 public protocolFee = 0; //protocol fee share in bps
-    uint256 public settlerFee = 5; //settlerFee in bps
+    uint256 public protocolFee = 5; //protocol fee share in bps
+    uint256 public settlerFee = 0; //settlerFee in bps
+
+    //Upkeep variables
+    int24 private lastCheckedTick; 
+    mapping(int24 => uint256[]) activeBuys;
+    mapping(int24 => uint256[]) activeSells;
+    //! Upkeep variables 
 
     string public pairName;
 
@@ -70,6 +76,7 @@ contract UniV3TradingPair is IERC721Receiver {
         FEE = IUniswapV3Pool(pool_address).fee();
         treasury = _treasury;
         settlerInit = _settlerInit;
+        (, lastCheckedTick , , , , , ) = IUniswapV3Pool(pool_address).slot0();
     }
 
     /*----------------------------------------------------------*/
@@ -101,6 +108,122 @@ contract UniV3TradingPair is IERC721Receiver {
             uint256 quantity
     );
 
+
+    /*----------------------------------------------------------*/
+    /*                     CHAINLINK KEEPER                     */
+    /*----------------------------------------------------------*/
+
+    function checkUpkeep(
+        bytes calldata checkData
+    ) public view returns (
+        bool upkeepNeeded,
+        bytes memory performData
+    ){
+        
+        int24 currentTick = getCurrentPoolTick();
+        int24 tickSpacing = pool.tickSpacing(); 
+
+        bytes memory pos;
+
+        if(lastCheckedTick == currentTick) {
+            // Price didn't change since last time >> No need to check orders
+            upkeepNeeded = false;
+        }
+        
+        if(lastCheckedTick < currentTick) {
+            // Price is higher than last check: 
+            //  We need to check if there are ticks 
+            //  with active sell orders to settle
+
+            //Check the number of active positions between our ticks
+            ( ,uint256 totalSellPositions) = noActivePositionsBetweenTicks(lastCheckedTick, currentTick, tickSpacing);
+
+            if (totalSellPositions == 0){
+                //If no position => no upkeep needed
+                upkeepNeeded = false;
+            }
+            else{
+                //Else, upkeep needed and initiate an array to store all positions
+                upkeepNeeded = true;
+                uint256[] memory positions = new uint256[](totalSellPositions);
+
+                //Fill in the array
+                uint256 iter = 0;
+                for (int24 i = lastCheckedTick; i < currentTick; i += tickSpacing){
+                    for (uint j = 0; j < activeSells[i].length; j++){
+                        if(iter < totalSellPositions){ //to avoid array overflow
+                            positions[iter] = activeSells[i][j];
+                            iter++;
+                        }
+                    }
+                }
+
+                pos = abi.encode(positions, lastCheckedTick, currentTick);
+            }       
+        }
+
+        if(lastCheckedTick > currentTick) {
+            // Price is lower than last check: 
+            //  We need to check if there are ticks 
+            //  with active sell orders to settle
+
+            //Check the number of active positions between our ticks
+            (uint256 totalBuyPositions, ) = noActivePositionsBetweenTicks(currentTick + tickSpacing, lastCheckedTick + tickSpacing, tickSpacing);
+
+            if (totalBuyPositions == 0){
+                //If no position => no upkeep needed
+                upkeepNeeded = false;
+            }
+            else{
+                //Else, upkeep needed and initiate an array to store all positions
+                upkeepNeeded = true;
+                uint256[] memory positions = new uint256[](totalBuyPositions);
+
+                //Fill in the array
+                uint256 iter = 0;
+                for (int24 i = currentTick + tickSpacing; i < lastCheckedTick + tickSpacing; i += tickSpacing){
+                    for (uint j = 0; j < activeBuys[i].length; j++){
+                        if(iter < totalBuyPositions){ //to avoid array overflow
+                            positions[iter] = activeBuys[i][j];
+                            iter++;
+                        }
+                    }
+                }
+
+                pos = abi.encode(positions, lastCheckedTick, currentTick);
+            }  
+        }
+
+        performData = pos;
+
+    }
+
+    function noActivePositionsBetweenTicks(
+        int24 tickLower, 
+        int24 tickUpper,
+        int24 tickSpacing
+    ) 
+    private 
+    view
+    returns (
+        uint256 noBuyPositions,
+        uint256 noSellPositions
+    ){
+        assert(tickLower <= tickUpper);
+
+        noBuyPositions = 0;
+        noSellPositions = 0;
+
+        for(int24 i = tickLower; i < tickUpper; i += tickSpacing) {
+            noBuyPositions += activeBuys[i].length;
+            noSellPositions += activeSells[i].length;
+        }
+    }
+
+    /*function performUpkeep() {
+        
+    }*/
+
     /*----------------------------------------------------------*/
     /*                  USER FACING FUNCTIONS                   */
     /*----------------------------------------------------------*/
@@ -108,9 +231,7 @@ contract UniV3TradingPair is IERC721Receiver {
     /// notice: Opens a limit order my minting a LP position on the 0.3% Uniswap v3 Pair
     function createOrder(
         bool side,
-        uint160 sqrtPriceX96, //uniswap sqrt(price) * 2 ** 96
-        //int24 tickLower,
-        //int24 tickUpper,
+        uint160 sqrtPriceX96, 
         uint256 quantity
     ) public payable returns (uint256 positionId) {
 
@@ -242,10 +363,9 @@ contract UniV3TradingPair is IERC721Receiver {
         emit Close();
     }
 
-    //Called from a settler that collects trading fees for settling trades
     function settleOrder(
         uint256 positionId
-    ) external {
+    ) private {
         int24 poolTick = getCurrentPoolTick();
 
         //Check that the position is fully out of range
@@ -297,6 +417,7 @@ contract UniV3TradingPair is IERC721Receiver {
         uint256 positionFee0,
         uint256 positionFee1
     ) private {
+        //Gas optimisation possibility: keep settler fees and add a claimFees() function
         uint256 bpsDivide = 10000; // 100*100
         
         /*uint256 userAmount0;
@@ -381,7 +502,7 @@ contract UniV3TradingPair is IERC721Receiver {
             })
         );
 
-        //refund unused tokens
+        //refund unused tokens -- this should be optimized for gas: first calculated the amount to send, then take it from the user
         if(amount0ToMint > amount0){
             uint256 refund0 = amount0ToMint - amount0;
             IERC20(poolToken0).safeTransfer(msg.sender, refund0);
