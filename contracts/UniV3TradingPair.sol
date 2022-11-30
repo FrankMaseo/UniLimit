@@ -22,6 +22,7 @@ import "@openzeppelin/master/contracts/introspection/ERC165.sol";*/
 
 contract UniV3TradingPair is IERC721Receiver {
     
+    //using SafeMath for uint160;
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
@@ -96,10 +97,23 @@ contract UniV3TradingPair is IERC721Receiver {
     /*                          EVENTS                          */
     /*----------------------------------------------------------*/
 
-    event Open();
-    event Close();
-    event Increase();
-    event Decrease();
+    event Open(
+        uint256 positionId,
+        address trader,
+        bool side,
+        uint160 sqrtPriceX96,
+        uint256 quantity
+    );
+
+    event Close(
+        uint256 positionId
+    );
+
+    event SizeChanged(
+        uint256 positionId,
+        uint256 newQuantity
+    );
+
     event Settled(
             bool side,
             uint256 positionId,
@@ -110,7 +124,7 @@ contract UniV3TradingPair is IERC721Receiver {
 
 
     /*----------------------------------------------------------*/
-    /*                     CHAINLINK KEEPER                     */
+    /*                     KEEPER FUNCTIONS                     */
     /*----------------------------------------------------------*/
 
     function checkUpkeep(
@@ -198,6 +212,45 @@ contract UniV3TradingPair is IERC721Receiver {
 
     }
 
+    function performUpkeep(bytes calldata performData) external {
+
+        (uint256[] memory _positions, int24 _lastCheckedTick, int24 _currentTick) = abi.decode(performData,(uint256[], int24, int24));
+
+        //Check that last checked tick is equal
+        require(_lastCheckedTick == lastCheckedTick, "upkeep frontran");
+
+        //Check that current Tick didn't change since checkUpkeep:
+        // If the price continued to trend in the same direction as it was trending since last checkUpkeep, it's fine, the positions 
+        // passed to settle are a subset of the total settlable positions. 
+
+        int24 currentTick = getCurrentPoolTick();
+
+        require(
+            _currentTick > _lastCheckedTick ?   //currentTick != lastCheckedTick else performUpkeed wouldn't be called
+            _currentTick <= currentTick :       //currentTick kept going up?
+            _currentTick >= currentTick         //currentTick kept going down?
+
+            , "upkeep obsolete: price change"
+        );
+
+        for(uint256 p = 0; p < _positions.length; p++){
+            
+            //ensure position is still active
+            if(orders[_positions[p]].active){
+                //recheck that order is closable : price is below lower tick (if buy) or above upper tick (if sell) 
+                if(
+                    orders[_positions[p]].side && orders[_positions[p]].tickLower > currentTick 
+                    || orders[_positions[p]].side == false && orders[_positions[p]].tickUpper < currentTick
+                ){
+                    settleOrder(_positions[p]);
+                }
+            }
+        }
+
+        //update last checked tick
+        lastCheckedTick = _currentTick;
+    }
+
     function noActivePositionsBetweenTicks(
         int24 tickLower, 
         int24 tickUpper,
@@ -219,10 +272,6 @@ contract UniV3TradingPair is IERC721Receiver {
             noSellPositions += activeSells[i].length;
         }
     }
-
-    /*function performUpkeep() {
-        
-    }*/
 
     /*----------------------------------------------------------*/
     /*                  USER FACING FUNCTIONS                   */
@@ -267,13 +316,19 @@ contract UniV3TradingPair is IERC721Receiver {
             side: side,
             tickLower: tickLower,
             tickUpper: tickUpper,
-            quantity: _amount0 + _amount1,
+            quantity: _amount0.add(_amount1),
             liquidity: _liquidity,
             owner: msg.sender,
             active: true
         });
 
-        emit Open();
+        emit Open(
+            positionId,
+            msg.sender,
+            side,
+            getPriceFromTicks(tickLower, tickUpper),
+            orders[positionId].quantity
+        );
     }
 
     function increaseSize(
@@ -297,16 +352,24 @@ contract UniV3TradingPair is IERC721Receiver {
             quantity
         );
 
+        IERC20(token).safeIncreaseAllowance(
+            address(nftManager),
+            quantity
+        );
+        
         uint128 _liquidity;
         uint256 _amount0;
         uint256 _amount1;
 
         (_liquidity, _amount0, _amount1) = increaseLiquidityCurrentRange(positionId, token, quantity);
         
-        orders[positionId].quantity = _amount0 + _amount1;
+        orders[positionId].quantity = _amount0.add(_amount1);
         orders[positionId].liquidity = _liquidity;
         
-        emit Increase();
+        emit SizeChanged(
+            positionId,
+            orders[positionId].quantity
+        );
     }
 
     /// notice: Decreases the order size of a limit order position
@@ -337,10 +400,7 @@ contract UniV3TradingPair is IERC721Receiver {
         //update liquidity values
         orders[positionId].quantity -= _amount0 + _amount1;
         orders[positionId].liquidity = getPositionLiquidity(positionId);
-        if(orders[positionId].liquidity<0) {
-            orders[positionId].active = false;
-            //burn(positionId);
-        }
+        
         
         //transfer back the tokens to the msg.sender
         uint256 refund0 = _amount0 + fees0;
@@ -349,18 +409,24 @@ contract UniV3TradingPair is IERC721Receiver {
         IERC20(poolToken0).safeTransfer(msg.sender, refund0);
         IERC20(poolToken1).safeTransfer(msg.sender, refund1);
 
-        emit Decrease();
+        //decreased position to zero
+        if(orders[positionId].liquidity<=0) {
+            orders[positionId].active = false;
+            emit Close(positionId);
+        }
+        else{
+            emit SizeChanged(
+                positionId,
+                orders[positionId].quantity
+            );
+        }
+        
     }
 
     /// notice: Closes a limit order position, has to be triggered by the owner of the position
-    function closePositionOwner(
-        uint256 positionId
-    )
-    external {
+    function closePositionOwner(uint256 positionId) external {
         uint256 _quantity = orders[positionId].quantity;
         decreaseSize(positionId,_quantity); //decrease by the total position Size
-
-        emit Close();
     }
 
     function settleOrder(
@@ -557,6 +623,33 @@ contract UniV3TradingPair is IERC721Receiver {
         IERC20(token).safeTransfer(msg.sender, refund);
     }
 
+    function decreaseLiquidityCurrentRange(
+        uint256 positionId,
+        uint128 liquidity
+    ) private returns (uint256 amount0, uint256 amount1){
+        
+        (int24 tickLower, int24 tickUpper) = getTicks(positionId);
+
+        uint256 _amount0;
+        uint256 _amount1;
+
+        (_amount0, _amount1) = LiquidityAmounts.getAmountsForLiquidity(
+            getPoolPrice(),
+            getPriceFromTick(tickLower),
+            getPriceFromTick(tickUpper),
+            liquidity
+        );
+
+        (amount0, amount1) = nftManager.decreaseLiquidity(
+            INonfungiblePositionManager.DecreaseLiquidityParams({
+                tokenId: positionId,
+                liquidity: liquidity,
+                amount0Min: _amount0,
+                amount1Min: _amount1,
+                deadline: block.timestamp
+            })
+        );
+    }
 
     function withdraw(
         uint256 positionId,
@@ -593,33 +686,7 @@ contract UniV3TradingPair is IERC721Receiver {
         _liquidity = uint128(amount.mul(orders[positionId].liquidity).div(orders[positionId].quantity));
     }
 
-    function decreaseLiquidityCurrentRange(
-        uint256 positionId,
-        uint128 liquidity
-    ) private returns (uint256 amount0, uint256 amount1){
-        
-        (int24 tickLower, int24 tickUpper) = getTicks(positionId);
-
-        uint256 _amount0;
-        uint256 _amount1;
-
-        (_amount0, _amount1) = LiquidityAmounts.getAmountsForLiquidity(
-            getPoolPrice(),
-            getPriceFromTick(tickLower),
-            getPriceFromTick(tickUpper),
-            liquidity
-        );
-
-        (amount0, amount1) = nftManager.decreaseLiquidity(
-            INonfungiblePositionManager.DecreaseLiquidityParams({
-                tokenId: positionId,
-                liquidity: liquidity,
-                amount0Min: _amount0,
-                amount1Min: _amount1,
-                deadline: block.timestamp
-            })
-        );
-    }
+    
 
 
     function getTicks(
@@ -682,6 +749,12 @@ contract UniV3TradingPair is IERC721Receiver {
         }
     }
 
+    function getPriceFromTicks(int24 tickLower, int24 tickUpper) public view returns(uint160 sqrtPriceX96){
+        uint160 p1 = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 p2 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        sqrtPriceX96 = (p1 + p2) / 2;
+    }
 
     /*----------------------------------------------------------*/
     /*                      UNISWAP UTILS                       */

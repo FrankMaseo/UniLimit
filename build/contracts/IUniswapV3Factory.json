@@ -2171,7 +2171,7 @@
   },
   "networks": {},
   "schemaVersion": "3.4.10",
-  "updatedAt": "2022-11-21T10:26:26.461Z",
+  "updatedAt": "2022-11-28T10:23:05.908Z",
   "devdoc": {
     "events": {
       "FeeAmountEnabled(uint24,int24)": {
