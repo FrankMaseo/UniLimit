@@ -7,11 +7,33 @@ const nftManagerABI = [{"inputs":[{"internalType":"address","name":"_factory","t
 const UniV3TradingPair = artifacts.require("UniV3TradingPair");
 
 const UniswapNFTPositionManager = new web3.eth.Contract(nftManagerABI, nftManager);
+const goerliUSDCWETHPool = '0x614dAdD4af14781A76aD6a9a0ecb8e207C557744'
+const testAddress = '0x78fe389778e5e8be04c4010Ac407b2373B987b62'
 
+
+const USDCWETHPool = '0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8'
+const ganacheOwner = '0xa795155c094CACbb41a867B52A8596Ac7F5D376A'
 
 module.exports = function(deployer) {
   // Deploy Position Manager
   //deployer.deploy(PositionManager);
   //deployer.deploy(SwapExamples);
-  deployer.deploy(UniV3TradingPair);
+  
+  //DevNet deployer
+  /*deployer.deploy(
+    UniV3TradingPair,
+    USDCWETHPool,
+    nftManager,
+    ganacheOwner, 
+    ganacheOwner
+  );*/
+
+  //Goerli deployer
+  deployer.deploy(
+    UniV3TradingPair,
+    goerliUSDCWETHPool,
+    nftManager,
+    testAddress
+  );
+
 };
